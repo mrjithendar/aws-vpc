@@ -1,29 +1,43 @@
 resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.vpc.id
-  tags = (merge(local.common_tags, tomap({
-    "Name"    = "${local.name_prefix}-igw-${var.environment}",
-    "Purpose" = "igw for ${local.common_tags["Team"]}"
-  })))
+
+  tags = {
+    Name = "${local.name}-igw"
+  }
 }
 
-resource "aws_eip" "eip" {
-  count       = length(aws_subnet.vpc_public_subnets)
-  tags = (merge(local.common_tags, tomap({
-    "Name"    = "${local.name_prefix}-eip-${count.index + 1}-${var.environment}",
-    "Purpose" = "${local.common_tags["Team"]} eip"
-  })))
+# IPv6 egress for private subnets (outbound-only, the IPv6 counterpart of NAT).
+resource "aws_egress_only_internet_gateway" "eigw" {
+  count  = var.enable_ipv6 ? 1 : 0
+  vpc_id = aws_vpc.vpc.id
+
+  tags = {
+    Name = "${local.name}-eigw"
+  }
 }
 
+resource "aws_eip" "nat" {
+  count  = local.nat_count
+  domain = "vpc"
+
+  tags = {
+    Name = "${local.name}-nat-eip-${var.azs[count.index]}"
+  }
+
+  depends_on = [aws_internet_gateway.igw]
+}
+
+# One NAT gateway per AZ (prod) so an AZ failure doesn't take out egress for the
+# others, or one shared NAT gateway (single_nat_gateway = true) for non-prod.
 resource "aws_nat_gateway" "ngw" {
-  count             = length(aws_subnet.vpc_private_subnets)
+  count             = local.nat_count
   connectivity_type = "public"
-  allocation_id     = aws_eip.eip[count.index].id
-  subnet_id         = local.publicSubnets[count.index]
-  tags = (merge(local.common_tags, tomap({
-    "Name"    = "${local.name_prefix}-ngw-${count.index + 1}-${var.environment}",
-    "Purpose" = "${local.common_tags["Team"]} nat gateway"
-  })))
-  # To ensure proper ordering, it is recommended to add an explicit dependency
-  # on the Internet Gateway for the VPC.
+  allocation_id     = aws_eip.nat[count.index].id
+  subnet_id         = aws_subnet.public[count.index].id
+
+  tags = {
+    Name = "${local.name}-ngw-${var.azs[count.index]}"
+  }
+
   depends_on = [aws_internet_gateway.igw]
 }
