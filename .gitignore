@@ -1,5 +1,18 @@
-.terraform
-.terraform.lock.hcl
+# Terraform working files
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
 planfile
+*.tfplan
+
+# NOTE: .terraform.lock.hcl is intentionally NOT ignored. Commit it so every
+# run uses the same provider versions and checksums.
+
 .DS_Store
 *.sql
