@@ -2,14 +2,19 @@ name: Deploy aws-vpc
 
 # PR to master        -> static checks + plan dev & prod (plan posted as PR comment)
 # Push/merge to master -> checks -> plan+apply dev -> plan+apply prod (prod waits for approval)
+#                         ...only when repo variable AWS_VPC_DEPLOYER is 'github' (the default).
+#                         Set it to 'jenkins' or 'gitlab' to make GitHub Actions plan-only on master.
+# Nightly              -> drift detection: plan both envs, fail the job if anything drifted
 # Manual run           -> plan (and optionally apply) a single environment
 on:
   pull_request:
     branches: [master]
-    paths-ignore: ["docs/**", "**.md", "Jenkinsfile"]
+    paths-ignore: ["docs/**", "**.md", "Jenkinsfile", ".gitlab-ci.yml"]
   push:
     branches: [master]
-    paths-ignore: ["docs/**", "**.md", "Jenkinsfile"]
+    paths-ignore: ["docs/**", "**.md", "Jenkinsfile", ".gitlab-ci.yml"]
+  schedule:
+    - cron: "30 20 * * *" # 02:00 IST nightly drift check
   workflow_dispatch:
     inputs:
       environment:
@@ -86,16 +91,17 @@ jobs:
       pull-requests: write
     with:
       environment: dev
-      apply: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.apply) }}
+      apply: ${{ (github.event_name == 'push' && (vars.AWS_VPC_DEPLOYER || 'github') == 'github') || (github.event_name == 'workflow_dispatch' && inputs.apply) }}
 
   prod:
     name: prod
     needs: [checks, dev]
     # Runs after dev on PRs and merges; on a manual prod run dev is skipped.
+    # Nightly drift checks run prod even if dev drifted.
     if: >-
       always() &&
       needs.checks.result == 'success' &&
-      (needs.dev.result == 'success' || needs.dev.result == 'skipped') &&
+      (needs.dev.result == 'success' || needs.dev.result == 'skipped' || github.event_name == 'schedule') &&
       (github.event_name != 'workflow_dispatch' || inputs.environment == 'prod')
     uses: ./.github/workflows/terraform-env.yml
     permissions:
@@ -104,4 +110,4 @@ jobs:
       pull-requests: write
     with:
       environment: prod
-      apply: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.apply) }}
+      apply: ${{ (github.event_name == 'push' && (vars.AWS_VPC_DEPLOYER || 'github') == 'github') || (github.event_name == 'workflow_dispatch' && inputs.apply) }}

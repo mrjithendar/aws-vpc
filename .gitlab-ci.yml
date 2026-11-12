@@ -1,0 +1,225 @@
+# GitLab CI for aws-vpc. Works with a GitLab-hosted copy of the repo (or a pull mirror) and with
+# "CI/CD for external repo" on GitHub (external pull request pipelines).
+#
+#   MR / external PR / branch -> checks + plan dev & prod (plan only; MR widget shows the plan summary)
+#   default branch push      -> checks + plan -> apply dev -> apply prod (manual = approval)
+#                               ...only when AWS_VPC_DEPLOYER == "gitlab"; otherwise plan-only.
+#   scheduled pipeline       -> drift detection: plan both envs, job warns if anything drifted
+#   Run pipeline (web)       -> TF_ENV=dev|prod, APPLY=true|false (default branch only)
+#
+# AWS auth: GitLab OIDC ID token -> AssumeRoleWithWebIdentity. Terraform's AWS SDK reads
+# AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE natively, so no AWS CLI or static keys are needed.
+# CI/CD variables to set (Settings -> CI/CD -> Variables):
+#   AWS_VPC_PLAN_ROLE_ARN, AWS_VPC_APPLY_ROLE_ARN   (from bootstrap/ci-roles outputs)
+#   AWS_VPC_DEPLOYER = gitlab                       (only if GitLab should auto-apply)
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "external_pull_request_event"
+    # Avoid duplicate branch + MR pipelines.
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|web|schedule)$/
+
+variables:
+  TF_ENV:
+    value: dev
+    options: [dev, prod]
+    description: Environment for a manually run pipeline
+  APPLY:
+    value: "false"
+    options: ["false", "true"]
+    description: Apply after plan (default branch only; prod still needs a manual click)
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "0"
+  AWS_REGION: us-east-1
+  TF_PLUGIN_CACHE_DIR: $CI_PROJECT_DIR/.tf-plugin-cache
+
+default:
+  image:
+    # Keep in step with the Terraform version used by GitHub Actions and Jenkins.
+    name: hashicorp/terraform:1.13.3
+    entrypoint: [""]
+  interruptible: true
+  cache:
+    key: tf-plugins-${CI_COMMIT_REF_SLUG}
+    paths: [.tf-plugin-cache/]
+
+stages: [checks, plan, apply]
+
+#------------------------------------------------------------------
+# Templates
+#------------------------------------------------------------------
+.aws_oidc:
+  id_tokens:
+    AWS_ID_TOKEN:
+      aud: sts.amazonaws.com
+  before_script:
+    - mkdir -p "$TF_PLUGIN_CACHE_DIR"
+    - printf '%s' "$AWS_ID_TOKEN" > "$CI_BUILDS_DIR/.aws-web-identity-token"
+    - export AWS_WEB_IDENTITY_TOKEN_FILE="$CI_BUILDS_DIR/.aws-web-identity-token"
+    - export AWS_ROLE_ARN="$ROLE_ARN"
+    - export AWS_ROLE_SESSION_NAME="gitlab-aws-vpc-${CI_JOB_ID}"
+    - test -n "$AWS_ROLE_ARN" || { echo "ROLE_ARN is empty; set the AWS_VPC_*_ROLE_ARN CI/CD variables"; exit 1; }
+    - terraform init -input=false -reconfigure -backend-config=backend/${ENV}.hcl
+
+.plan:
+  extends: .aws_oidc
+  stage: plan
+  variables:
+    ROLE_ARN: $AWS_VPC_PLAN_ROLE_ARN
+  script:
+    - |
+      ec=0
+      terraform plan -input=false -no-color -lock-timeout=5m \
+        -var-file=vars/${ENV}.tfvars -out=planfile -detailed-exitcode > plan-${ENV}.log 2>&1 || ec=$?
+      cat plan-${ENV}.log
+      # 0 = no changes, 1 = error, 2 = changes present
+      [ "$ec" -eq 1 ] && exit 1
+      terraform show -no-color planfile > plan-${ENV}.txt
+      # Report for the MR Terraform widget
+      summary=$(grep -E '^(Plan:|No changes\.)' plan-${ENV}.log | tail -1 || true)
+      num() { echo "$summary" | sed -n "s/.*[^0-9]\([0-9][0-9]*\) to $1.*/\1/p"; }
+      add=$(num add); chg=$(num change); del=$(num destroy)
+      printf '{"create":%s,"update":%s,"delete":%s}\n' "${add:-0}" "${chg:-0}" "${del:-0}" > plan-${ENV}.json
+      echo "PLAN_HAS_CHANGES=$([ "$ec" -eq 2 ] && echo true || echo false)" > plan-${ENV}.env
+      if [ "$ec" -eq 2 ] && [ "$CI_PIPELINE_SOURCE" = "schedule" ]; then
+        echo "Drift detected in ${ENV}: live infrastructure differs from ${CI_DEFAULT_BRANCH}"
+        exit 3
+      fi
+  allow_failure:
+    exit_codes: [3] # drift = warning, not a failed pipeline
+  artifacts:
+    name: plan-${ENV}
+    access: developer
+    expire_in: 1 week
+    when: always
+    paths:
+      - planfile
+      - .terraform.lock.hcl
+      - plan-${ENV}.txt
+      - plan-${ENV}.log
+    reports:
+      terraform: plan-${ENV}.json
+      dotenv: plan-${ENV}.env
+
+.apply:
+  extends: .aws_oidc
+  stage: apply
+  interruptible: false # never cancel an apply mid-way
+  variables:
+    ROLE_ARN: $AWS_VPC_APPLY_ROLE_ARN
+  script:
+    - |
+      if [ "$PLAN_HAS_CHANGES" != "true" ]; then
+        echo "Plan for ${ENV} has no changes; nothing to apply."
+        exit 0
+      fi
+      # Applies exactly the planned changes; Terraform refuses if state changed since the plan.
+      terraform apply -input=false -no-color -lock-timeout=5m planfile
+      terraform output -no-color | tee outputs-${ENV}.txt
+  artifacts:
+    expire_in: 1 month
+    paths:
+      - outputs-${ENV}.txt
+
+#------------------------------------------------------------------
+# Checks
+#------------------------------------------------------------------
+fmt-validate-test:
+  stage: checks
+  script:
+    - mkdir -p "$TF_PLUGIN_CACHE_DIR"
+    - terraform fmt -check -recursive -diff
+    - terraform init -backend=false -input=false
+    - terraform validate -no-color
+    - terraform test -no-color
+
+tflint:
+  stage: checks
+  image:
+    name: ghcr.io/terraform-linters/tflint:v0.58.0
+    entrypoint: [""]
+  cache: []
+  script:
+    - tflint --init
+    - tflint --format compact
+
+checkov:
+  stage: checks
+  image:
+    name: bridgecrew/checkov:latest
+    entrypoint: [""]
+  cache: []
+  script:
+    - checkov -d . --framework terraform --skip-path bootstrap --compact --quiet --output cli --output junitxml --output-file-path console,.
+  artifacts:
+    when: always
+    reports:
+      junit: results_junitxml.xml
+
+#------------------------------------------------------------------
+# Plan
+#------------------------------------------------------------------
+plan:dev:
+  extends: .plan
+  variables:
+    ENV: dev
+  resource_group: aws-vpc-plan-dev
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web" && $TF_ENV != "dev"
+      when: never
+    - when: on_success
+
+plan:prod:
+  extends: .plan
+  variables:
+    ENV: prod
+  resource_group: aws-vpc-plan-prod
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web" && $TF_ENV != "prod"
+      when: never
+    - when: on_success
+
+#------------------------------------------------------------------
+# Apply
+#------------------------------------------------------------------
+apply:dev:
+  extends: .apply
+  variables:
+    ENV: dev
+  needs: [plan:dev]
+  resource_group: aws-vpc-dev
+  environment:
+    name: dev
+    action: start
+  rules:
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "push" && $AWS_VPC_DEPLOYER == "gitlab"
+      when: on_success
+    - if: $CI_PIPELINE_SOURCE == "web" && $APPLY == "true" && $TF_ENV == "dev"
+      when: on_success
+
+apply:prod:
+  extends: .apply
+  variables:
+    ENV: prod
+  needs:
+    - plan:prod
+    - job: apply:dev
+      optional: true
+  resource_group: aws-vpc-prod
+  # Manual job = approval gate. On GitLab Premium, also protect the "prod"
+  # environment and require approvals.
+  environment:
+    name: prod
+    action: start
+  rules:
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "push" && $AWS_VPC_DEPLOYER == "gitlab"
+      when: manual
+    - if: $CI_PIPELINE_SOURCE == "web" && $APPLY == "true" && $TF_ENV == "prod"
+      when: manual
