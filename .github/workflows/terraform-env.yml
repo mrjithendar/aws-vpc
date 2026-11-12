@@ -68,6 +68,10 @@ jobs:
           terraform show -no-color planfile > plan.txt
           summary=$(grep -E '^(Plan:|No changes\.)' plan.log | tail -1 || true)
           echo "summary=${summary:-see log}" >> "$GITHUB_OUTPUT"
+          if [ "$ec" -eq 2 ] && [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "::error title=Drift detected (${{ inputs.environment }})::Live infrastructure differs from master. See the plan in the job summary."
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Job summary
         run: |
@@ -83,6 +87,10 @@ jobs:
             echo '```'
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail on drift
+        if: steps.plan.outputs.drift == 'true'
+        run: exit 1
 
       - name: Comment plan on PR
         if: github.event_name == 'pull_request'
