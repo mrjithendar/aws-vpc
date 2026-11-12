@@ -1,0 +1,189 @@
+name: terraform-env
+
+# Reusable: plan one environment, then (optionally) apply exactly that saved plan.
+#
+# Plan job  -> no GitHub environment, assumes vars.AWS_PLAN_ROLE_ARN (read-only + state lock).
+# Apply job -> runs in the GitHub environment named after inputs.environment, so its
+#              protection rules (e.g. required reviewers on prod) gate the apply. It assumes
+#              the environment variable AWS_ROLE_ARN (falls back to the repo variable).
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      apply:
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: "~1.13.0"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "0"
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  plan:
+    name: plan (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    # Fork PRs get no OIDC token; skip instead of failing.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          role-session-name: gha-aws-vpc-plan-${{ inputs.environment }}-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform init
+        run: terraform init -input=false -backend-config=backend/${{ inputs.environment }}.hcl
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -input=false -no-color -lock-timeout=5m \
+            -var-file=vars/${{ inputs.environment }}.tfvars \
+            -out=planfile -detailed-exitcode > plan.log 2>&1
+          ec=$?
+          set -e
+          cat plan.log
+          # 0 = no changes, 1 = error, 2 = changes present
+          if [ "$ec" -eq 1 ]; then exit 1; fi
+          if [ "$ec" -eq 2 ]; then echo "has_changes=true" >> "$GITHUB_OUTPUT"; else echo "has_changes=false" >> "$GITHUB_OUTPUT"; fi
+          terraform show -no-color planfile > plan.txt
+          summary=$(grep -E '^(Plan:|No changes\.)' plan.log | tail -1 || true)
+          echo "summary=${summary:-see log}" >> "$GITHUB_OUTPUT"
+          if [ "$ec" -eq 2 ] && [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "::error title=Drift detected (${{ inputs.environment }})::Live infrastructure differs from master. See the plan in the job summary."
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Job summary
+        run: |
+          {
+            echo "### Terraform plan: \`${{ inputs.environment }}\`"
+            echo ""
+            echo "**${{ steps.plan.outputs.summary }}**"
+            echo ""
+            echo "<details><summary>Full plan</summary>"
+            echo ""
+            echo '```hcl'
+            head -c 60000 plan.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail on drift
+        if: steps.plan.outputs.drift == 'true'
+        run: exit 1
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          SUMMARY: ${{ steps.plan.outputs.summary }}
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env.ENVIRONMENT;
+            const marker = `<!-- terraform-plan:${env} -->`;
+            let plan = fs.readFileSync('plan.txt', 'utf8');
+            if (plan.length > 60000) plan = plan.slice(0, 60000) + '\n... (truncated, see the job summary)';
+            const body = [
+              marker,
+              `### Terraform plan: \`${env}\``,
+              `**${process.env.SUMMARY}**`,
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```hcl',
+              plan,
+              '```',
+              '</details>',
+              '',
+              `_Commit ${context.sha.slice(0, 7)}, [run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})_`,
+            ].join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo, issue_number: context.issue.number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }
+
+      - name: Upload plan
+        if: inputs.apply && steps.plan.outputs.has_changes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # The lock file goes with the plan so apply uses identical provider builds.
+          path: |
+            planfile
+            plan.txt
+            .terraform.lock.hcl
+          include-hidden-files: true
+          retention-days: 5
+          if-no-files-found: error
+
+  apply:
+    name: apply (${{ inputs.environment }})
+    needs: plan
+    if: inputs.apply && needs.plan.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    # Protection rules on this environment (required reviewers, branch restriction)
+    # gate the apply. Reviewers can read the plan in the plan job's summary first.
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: aws-vpc-apply-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-aws-vpc-apply-${{ inputs.environment }}-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform init
+        run: terraform init -input=false -backend-config=backend/${{ inputs.environment }}.hcl
+
+      - name: terraform apply (saved plan)
+        # Fails safely with "Saved plan is stale" if state changed since the plan.
+        run: terraform apply -input=false -no-color -lock-timeout=5m planfile
+
+      - name: Outputs
+        run: |
+          {
+            echo "### Applied \`${{ inputs.environment }}\`"
+            echo '```'
+            terraform output -no-color
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

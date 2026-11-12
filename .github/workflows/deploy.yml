@@ -1,0 +1,113 @@
+name: Deploy aws-vpc
+
+# PR to master        -> static checks + plan dev & prod (plan posted as PR comment)
+# Push/merge to master -> checks -> plan+apply dev -> plan+apply prod (prod waits for approval)
+#                         ...only when repo variable AWS_VPC_DEPLOYER is 'github' (the default).
+#                         Set it to 'jenkins' or 'gitlab' to make GitHub Actions plan-only on master.
+# Nightly              -> drift detection: plan both envs, fail the job if anything drifted
+# Manual run           -> plan (and optionally apply) a single environment
+on:
+  pull_request:
+    branches: [master]
+    paths-ignore: ["docs/**", "**.md", "Jenkinsfile", ".gitlab-ci.yml"]
+  push:
+    branches: [master]
+    paths-ignore: ["docs/**", "**.md", "Jenkinsfile", ".gitlab-ci.yml"]
+  schedule:
+    - cron: "30 20 * * *" # 02:00 IST nightly drift check
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment
+        type: choice
+        options: [dev, prod]
+        default: dev
+      apply:
+        description: Apply after plan (prod still needs environment approval)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # PRs: newest commit wins. Deploys: queue, never cancel a running apply.
+  group: aws-vpc-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.number) || 'deploy' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TF_VERSION: "~1.13.0"
+
+jobs:
+  checks:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform init (no backend)
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      - name: terraform test (mocked provider, no AWS credentials)
+        run: terraform test -no-color
+
+      - uses: terraform-linters/setup-tflint@v4
+
+      - name: tflint
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids rate limits when downloading the AWS ruleset
+        run: |
+          tflint --init
+          tflint --format compact
+
+      - name: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform
+          quiet: true
+          compact: true
+          skip_path: bootstrap
+
+  dev:
+    name: dev
+    needs: checks
+    if: github.event_name != 'workflow_dispatch' || inputs.environment == 'dev'
+    uses: ./.github/workflows/terraform-env.yml
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    with:
+      environment: dev
+      apply: ${{ (github.event_name == 'push' && (vars.AWS_VPC_DEPLOYER || 'github') == 'github') || (github.event_name == 'workflow_dispatch' && inputs.apply) }}
+
+  prod:
+    name: prod
+    needs: [checks, dev]
+    # Runs after dev on PRs and merges; on a manual prod run dev is skipped.
+    # Nightly drift checks run prod even if dev drifted.
+    if: >-
+      always() &&
+      needs.checks.result == 'success' &&
+      (needs.dev.result == 'success' || needs.dev.result == 'skipped' || github.event_name == 'schedule') &&
+      (github.event_name != 'workflow_dispatch' || inputs.environment == 'prod')
+    uses: ./.github/workflows/terraform-env.yml
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    with:
+      environment: prod
+      apply: ${{ (github.event_name == 'push' && (vars.AWS_VPC_DEPLOYER || 'github') == 'github') || (github.event_name == 'workflow_dispatch' && inputs.apply) }}

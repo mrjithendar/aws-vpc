@@ -54,9 +54,58 @@ Each environment has its own state file (`backend/<env>.hcl`). State is encrypte
 terraform init -backend=false && terraform test
 ```
 
-## CI (Jenkinsfile)
+## CI/CD: GitHub Actions, GitLab CI and Jenkins
 
-`init` → `fmt -check` / `validate` / `tflint` / `checkov` → `plan` (archived as `plan.txt`) → manual approval → `apply` of the saved plan. Credentials come from the agent's IAM role, optionally assuming `DEPLOY_ROLE_ARN`. There are no static access keys. The agent needs the `terraform` label and `terraform`, `tflint` and `checkov` installed.
+All three pipelines share the same design, so you can use any of them, or run more than one:
+
+| | GitHub Actions | GitLab CI | Jenkins |
+|---|---|---|---|
+| File | `.github/workflows/deploy.yml` + `terraform-env.yml` | `.gitlab-ci.yml` | `Jenkinsfile` (Multibranch) |
+| Checks | fmt, validate, `terraform test`, tflint, checkov | same | same, each in a pinned container |
+| PR / MR | plan dev + prod, posted as a PR comment | plan dev + prod, shown in the MR Terraform widget | plan dev + prod, archived as `plan-<env>.txt` |
+| Merge to `master` | apply dev → prod after environment approval | apply dev → prod as a manual job | apply dev → prod after `input` approval |
+| Nightly | drift check (job fails on drift) | drift check, if you add a pipeline schedule (job warns on drift) | drift check (build UNSTABLE on drift) |
+| Manual | `workflow_dispatch` (env, apply) | Run pipeline (`TF_ENV`, `APPLY`) | Build with Parameters (`ENV`, `APPLY`) |
+| AWS auth | GitHub OIDC | GitLab OIDC ID token | agent instance role → `sts:AssumeRole` |
+
+What all three share:
+- **No static AWS keys.** Plans use a read-only role and applies use a deploy role. Both come from `bootstrap/ci-roles`.
+- **The apply uses exactly the reviewed plan.** The saved `planfile` and lock file are passed from the plan step to the apply step. If state changed in between, Terraform stops with "Saved plan is stale" instead of applying something nobody reviewed.
+- The apply is skipped when a plan has no changes. Applies are serialized per environment and never cancelled mid-way.
+
+### Only one system auto-applies
+
+**`AWS_VPC_DEPLOYER` = `github` (default) | `gitlab` | `jenkins`** picks which pipeline auto-applies on merges to `master`. Set the same value everywhere: GitHub repo variable, GitLab CI/CD variable, and Jenkins global or folder env var. The other systems still run checks, plans and drift detection on `master` but never apply automatically. A manual apply is possible from any of them, and the S3 state lock plus the stale-plan check keep simultaneous runs safe.
+
+### One-time setup
+
+1. **IAM roles.** Apply `bootstrap/ci-roles` with admin credentials. Turn on the systems you use:
+   ```bash
+   cd bootstrap/ci-roles
+   terraform init
+   terraform apply \
+     -var enable_gitlab=true \
+     -var 'jenkins_role_arns=["arn:aws:iam::<acct>:role/<jenkins-agent-role>"]'
+   # Already have the GitHub or GitLab OIDC provider? Add -var create_github_oidc_provider=false / create_gitlab_oidc_provider=false
+   ```
+   This outputs `plan_role_arn` and `apply_role_arn`.
+2. **GitHub Actions**
+   - Repo variables: `AWS_PLAN_ROLE_ARN` (the plan role) and, optionally, `AWS_VPC_DEPLOYER`.
+   - Create environments `dev` and `prod`, each with variable `AWS_ROLE_ARN` (the apply role). On **prod**, add required reviewers and allow deployments only from `master`.
+3. **GitLab CI** (a project on gitlab.com or self-managed, either mirroring this repo or using *CI/CD for external repo*)
+   - CI/CD variables: `AWS_VPC_PLAN_ROLE_ARN`, `AWS_VPC_APPLY_ROLE_ARN`, and `AWS_VPC_DEPLOYER=gitlab` if GitLab should deploy.
+   - Make `master` a **protected branch**. The apply role only trusts `master`.
+   - On Premium, also protect the `prod` environment with required approvals.
+   - Add a nightly **pipeline schedule** on `master` for drift detection.
+   - Set `gitlab_url` and `gitlab_project_path` in the bootstrap if they differ from the defaults.
+4. **Jenkins**
+   - Create a Multibranch Pipeline job for this repo, with agents labelled `docker` that have Docker installed.
+   - Global or folder env vars: `AWS_VPC_PLAN_ROLE_ARN`, `AWS_VPC_APPLY_ROLE_ARN`, `AWS_VPC_DEPLOYER`, and `AWS_VPC_PROD_APPROVERS` (users or groups allowed to approve prod).
+   - On EC2 agents, set the IMDSv2 hop limit to 2 so containers can use the instance role.
+   - Plugins needed: Docker Pipeline, Timestamper and JUnit.
+5. **Branch protection** on `master`: require the checks and plan jobs to pass.
+
+Role permissions: the apply role has `AmazonVPCFullAccess`, rights on the flow-log bucket and log delivery, and the state prefix. The plan role has `ReadOnlyAccess` plus write access to the state prefix, which the S3 lock file needs.
 
 ## Migrating from the previous version
 
