@@ -30,7 +30,7 @@ env:
 jobs:
   plan:
     name: plan (${{ inputs.environment }})
-    runs-on: mk4
+    runs-on: ubuntu-24.04-arm
     # Fork PRs get no OIDC token; skip instead of failing.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     outputs:
@@ -147,7 +147,7 @@ jobs:
     name: apply (${{ inputs.environment }})
     needs: plan
     if: inputs.apply && needs.plan.outputs.has_changes == 'true'
-    runs-on: mk4
+    runs-on: ubuntu-24.04-arm
     # Protection rules on this environment (required reviewers, branch restriction)
     # gate the apply. Reviewers can read the plan in the plan job's summary first.
     environment: ${{ inputs.environment }}
